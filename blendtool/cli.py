@@ -72,7 +72,8 @@ def cmd_blend(args):
                offset_y=ty - (y0 + y1) // 2,
                offset_x=tx - (x0 + x1) // 2,
                feather_px=args.feather, strategy=args.strategy,
-               priority=args.priority, anchors=anchors)
+               priority=args.priority, anchors=anchors,
+               seam_column=args.seam)
     io_utils.save_rgb(args.out, br.result_display)
     report = {"metrics": br.metrics, "warnings": br.warnings,
               "components": br.components, "anchors": br.anchors_used}
@@ -127,6 +128,8 @@ def main(argv=None):
                     default="edge")
     pb.add_argument("--anchors", default=None,
                     help='JSON list of anchor dicts')
+    pb.add_argument("--seam", type=int, default=None,
+                    help="target-canvas x of a vertical seam partition")
     pb.add_argument("--out", required=True)
     pb.add_argument("--report", default=None)
     pb.set_defaults(func=cmd_blend)

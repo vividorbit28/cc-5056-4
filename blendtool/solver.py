@@ -25,6 +25,7 @@ residual statistics are returned.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import time
 
 import numpy as np
 from scipy import sparse
@@ -33,6 +34,8 @@ import warnings
 
 from .gradient import build_edges, guidance_field, edge_source_validity
 from .masks import connected_components, holes
+from .system_cache import (DEFAULT_CACHE, CachedSystem,
+                           structural_fingerprint)
 
 GAUGE_WEIGHT = 1e3
 ANCHOR_WEIGHT = 50.0
@@ -64,6 +67,7 @@ class BlendResult:
     components: list[dict] = field(default_factory=list)
     hole_pixels: int = 0
     anchors_used: list[dict] = field(default_factory=list)
+    system: dict | None = None
 
 
 def _check_anchors(anchors: list[dict], support: np.ndarray,
@@ -109,7 +113,11 @@ def blend(source: np.ndarray,
           anchors: list[dict] | None = None,
           anchor_weight: float = ANCHOR_WEIGHT,
           luminance_weight: float = LUMINANCE_WEIGHT,
-          gradient_weight_scale: float = 1.0) -> BlendResult:
+          gradient_weight_scale: float = 1.0,
+          use_cache: bool = True,
+          cache=None,
+          return_system: bool = False,
+          seam_column: int | None = None) -> BlendResult:
     """Run a full gradient-domain blend.
 
     source, target : float RGB arrays in [0,1]
@@ -120,7 +128,18 @@ def blend(source: np.ndarray,
     priority   : "edge" | "luminance" (only meaningful with anchors / soft)
     anchors    : [{"x","y" (target coords), "color":[..] or "source":True,
                    "weight": optional}]
+    seam_column: optional target-canvas x that splits the region; delegates to
+                 the seam-partition solver (see ``blendtool.seam``).
     """
+    if seam_column is not None:
+        from .seam import blend_seam
+        return blend_seam(
+            source, target, source_hard_mask, offset_y, offset_x,
+            seam_column, feather_px=feather_px, strategy=strategy,
+            priority=priority, anchors=anchors, anchor_weight=anchor_weight,
+            luminance_weight=luminance_weight,
+            gradient_weight_scale=gradient_weight_scale, cache=cache,
+            use_cache=use_cache)
     h, w = target.shape[:2]
     hard_src = source_hard_mask.astype(bool)
     if hard_src.sum() == 0:
@@ -181,7 +200,6 @@ def blend(source: np.ndarray,
     unknown_flat = np.flatnonzero(unknown.ravel())
     local = np.full(h * w, -1, dtype=np.int64)
     local[unknown_flat] = np.arange(unknown_flat.size)
-    n = unknown_flat.size
 
     # All solvers use the guidance definition directly:
     #   g = v_j - v_i, edge row (x_j - x_i) = g.
@@ -189,7 +207,8 @@ def blend(source: np.ndarray,
     # (x_j - x_i) - g expression.
     if not soft and not anchors_n:
         x, singular, solve_info = _solve_hard(
-            target, edges, g, unknown_flat, local, support, w)
+            target, edges, g, unknown_flat, local, support, w,
+            cache=cache, use_cache=use_cache)
         if singular:
             warnings_out.append(
                 "hard-mask system is singular (no Dirichlet boundary pixel "
@@ -198,7 +217,9 @@ def blend(source: np.ndarray,
     else:
         x, singular, solve_info = _solve_wls(
             target, src_emb, edges, g, w_edge, unknown_flat, local,
-            support, anchors_n, priority, anchor_weight, luminance_weight, w)
+            support, anchors_n, priority, anchor_weight, luminance_weight, w,
+            cache=cache, use_cache=use_cache,
+            return_diagnostics=return_system)
         if singular:
             warnings_out.append(
                 "system is singular (selection covers the entire canvas: no "
@@ -209,6 +230,12 @@ def blend(source: np.ndarray,
     result = target.copy()
     res_flat = result.reshape(-1, 3)
     res_flat[unknown_flat] = x
+
+    system = None
+    if "_A" in solve_info:
+        system = {"A": solve_info.pop("_A"), "b": solve_info.pop("_b"),
+                  "unknown_flat": unknown_flat, "local": local,
+                  "guidance": g, "edges": edges}
 
     br = BlendResult(
         result=result,
@@ -235,6 +262,8 @@ def blend(source: np.ndarray,
     )
     _finalize_metrics(br, target, src_emb, g, w_edge,
                       unknown_flat, local, hard, solve_info)
+    if return_system:
+        br.system = system
     return br
 
 
@@ -299,14 +328,23 @@ def _direct_copy(target, src_emb, hard, mask, edges, g, w_edge,
     return br
 
 
-def _solve_hard(target, edges, g, unknown_flat, local, support, width):
+def _solve_hard(target, edges, g, unknown_flat, local, support, width,
+                *, cache=None, use_cache=True):
     """Square SPD Laplacian system with Dirichlet boundary values.
 
     The discrete energy sum_edges (x_j - x_i - g_e)^2 yields, for each
     unknown pixel, a degree-diagonal Laplacian row. Interior edges build
     symmetric +/-1 off-diagonal entries; boundary edges contribute only a
     diagonal term with the known target colour moved to the RHS.
+
+    ``none`` is replaced by an SPD Laplacian matrix that depends only on the
+    region geometry (not on the guidance or target values).  The matrix is
+    cached by a fingerprint of the unknown set and edge topology, so repeated
+    solves of the same selection reuse the factorization and pay only for RHS
+    assembly, exactly like the WLS path.
     """
+    cache = DEFAULT_CACHE if cache is None else cache
+
     i, j = edges["i"], edges["j"]
     li, lj = local[i], local[j]
     ui, uj = li >= 0, lj >= 0
@@ -363,13 +401,18 @@ def _solve_hard(target, edges, g, unknown_flat, local, support, width):
                        iter_lim=LSQR_ITER_LIMIT)
             x[:, c] = sol[0]
             info[f"lsqr_stop_c{c}"] = int(sol[1])
-    else:
+        return x, singular, info
+
+    fp = structural_fingerprint(kind="hard", unknown=unknown_flat,
+                                i=i, j=j, interior=interior,
+                                bnd=bnd_edges)
+    entry = cache.get(fp) if use_cache else None
+    reused = entry is not None and entry.AtA.shape == L.shape
+    if not reused:
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("error", MatrixRankWarning)
                 lu = splu(L.tocsc())
-            for c in range(3):
-                x[:, c] = lu.solve(b[:, c])
         except (RuntimeError, ValueError, MatrixRankWarning):
             singular = True
             info["path"] = "lsqr_gauge"
@@ -379,59 +422,267 @@ def _solve_hard(target, edges, g, unknown_flat, local, support, width):
                            iter_lim=LSQR_ITER_LIMIT)
                 x[:, c] = sol[0]
                 info[f"lsqr_stop_c{c}"] = int(sol[1])
+            return x, singular, info
+        if use_cache:
+            cache.put(CachedSystem(fingerprint=fp, A=L, AtA=L, lu=lu,
+                                   meta={"kind": "hard"}))
+    else:
+        lu = entry.lu
+    for c in range(3):
+        x[:, c] = lu.solve(b[:, c])
+    info["cache_hit"] = bool(reused)
     return x, singular, info
 
 
-def _solve_wls(target, src_emb, edges, g, w_edge, unknown_flat, local,
-               support, anchors, priority, anchor_weight,
-               luminance_weight, width):
-    """Weighted least squares: gradient rows + anchor/luminance rows.
+def assemble_wls(target, src_emb, edges, g, w_edge, unknown_flat, local,
+                 support, anchors, priority, anchor_weight,
+                 luminance_weight, *, exclude_edges=None):
+    """Vectorized assembly of the weighted least-squares matrix and RHS.
 
-    Every row is assembled explicitly as ``sqrt(w) * (coeff dot x - rhs)``.
-    Edges leaving the support collapse to a one-term row whose known endpoint
-    is moved into the RHS, which is what enforces continuity through the
-    feather band and at canvas borders.
+    Row order (deterministic, independent of anchor/sparsity details):
+      * one ``sqrt(w) * (x_j - x_i - g)`` row per kept gradient edge, or the
+        single-unknown boundary form when one endpoint is fixed;
+      * one row per anchor;
+      * (luminance priority) one soft source-colour row per unknown;
+      * a zero-mean gauge row only when the support has no fixed neighbour and
+        no anchor.
+
+    Unlike the historical per-edge Python loop this builds the whole COO
+    triplet array with NumPy indexing, which is O(E) vector work instead of
+    O(E) interpreter steps.  The mathematics is unchanged.
     """
     i, j = edges["i"], edges["j"]
     li, lj = local[i], local[j]
     n = unknown_flat.size
     tgt = target.reshape(-1, 3)
 
+    w_all = np.maximum(np.asarray(w_edge, dtype=np.float64), 0.0)
+    keep = w_all > 0.0
+    if exclude_edges is not None:
+        keep &= ~np.asarray(exclude_edges, dtype=bool)
+    eidx = np.flatnonzero(keep)
+    sw = np.sqrt(w_all[eidx])
+
+    li_e, lj_e = li[eidx], lj[eidx]
+    rows_i, rows_j = li_e >= 0, lj_e >= 0
+    interior = rows_i & rows_j
+    only_i = rows_i & ~rows_j
+    only_j = rows_j & ~rows_i
+
+    R_edge = eidx.size
+    parts_rows = []
+    parts_cols = []
+    parts_vals = []
+
+    ri = np.flatnonzero(interior)
+    if ri.size:
+        parts_rows.append(np.concatenate([ri, ri]))
+        parts_cols.append(np.concatenate([li_e[ri], lj_e[ri]]))
+        parts_vals.append(np.concatenate([-sw[ri], sw[ri]]))
+    rb_i = np.flatnonzero(only_i)
+    if rb_i.size:
+        parts_rows.append(rb_i)
+        parts_cols.append(li_e[rb_i])
+        parts_vals.append(sw[rb_i])
+    rb_j = np.flatnonzero(only_j)
+    if rb_j.size:
+        parts_rows.append(rb_j)
+        parts_cols.append(lj_e[rb_j])
+        parts_vals.append(sw[rb_j])
+
+    row_ptr = R_edge
+    anchor_rows = []
+    for a in anchors:
+        lf = local[a["flat"]]
+        if lf < 0:
+            continue
+        w = a["weight"] if a["weight"] else anchor_weight
+        if priority == "luminance":
+            w = w * 4.0
+        s = np.sqrt(w)
+        parts_rows.append(np.array([row_ptr], dtype=np.int64))
+        parts_cols.append(np.array([lf], dtype=np.int64))
+        parts_vals.append(np.array([s]))
+        anchor_rows.append((row_ptr, int(lf), s, np.asarray(a["color"])))
+        row_ptr += 1
+
+    lum_start = None
+    if priority == "luminance":
+        s = np.sqrt(luminance_weight)
+        lum_start = row_ptr
+        parts_rows.append(np.arange(lum_start, lum_start + n, dtype=np.int64))
+        parts_cols.append(np.arange(n, dtype=np.int64))
+        parts_vals.append(np.full(n, s))
+        row_ptr += n
+
+    reaches_known = bool(np.any(~rows_i | ~rows_j))
+    singular = (not reaches_known) and (len(anchor_rows) == 0)
+    if singular:
+        parts_rows.append(np.zeros(n, dtype=np.int64))
+        parts_cols.append(np.arange(n, dtype=np.int64))
+        parts_vals.append(np.full(n, np.sqrt(GAUGE_WEIGHT)))
+        row_ptr += 1
+
+    if row_ptr == 0:
+        raise np.linalg.LinAlgError(
+            "no constraint rows: the selection has neither interior edges "
+            "nor anchors (system is empty and underdetermined)")
+
+    rows = np.concatenate(parts_rows)
+    cols = np.concatenate(parts_cols)
+    vals = np.concatenate(parts_vals)
+    A = sparse.coo_matrix((vals, (rows, cols)), shape=(row_ptr, n)).tocsr()
+    A.eliminate_zeros()
+
+    b = np.zeros((row_ptr, 3))
+    gi = np.flatnonzero(interior)
+    if gi.size:
+        b[gi] = sw[gi, None] * g[eidx[gi]]
+    if rb_i.size:
+        b[rb_i] = sw[rb_i, None] * (tgt[j[eidx[rb_i]]] - g[eidx[rb_i]])
+    if rb_j.size:
+        b[rb_j] = sw[rb_j, None] * (tgt[i[eidx[rb_j]]] + g[eidx[rb_j]])
+    for (r, _lf, s, color) in anchor_rows:
+        b[r] = s * color
+    if lum_start is not None:
+        b[lum_start:lum_start + n] = (
+            np.sqrt(luminance_weight) * src_emb.reshape(-1, 3)[unknown_flat])
+
+    info = {"rows": int(A.shape[0]), "unknowns": int(n),
+            "gauge": bool(singular)}
+    return A, b, singular, info
+
+
+def _wls_fingerprint(edges, w_edge, unknown_flat, anchors, priority,
+                     anchor_weight, luminance_weight, singular_flag,
+                     exclude_edges):
+    """Structural hash: everything that changes A, nothing that only
+    changes the right-hand side."""
+    anchor_pos = tuple(sorted((int(a["flat"]),
+                               float(a["weight"] if a["weight"]
+                                     else anchor_weight))
+                              for a in anchors))
+    excl = (np.flatnonzero(np.asarray(exclude_edges, dtype=bool))
+            if exclude_edges is not None else np.zeros(0, dtype=np.int64))
+    return structural_fingerprint(
+        edges_i=edges["i"], edges_j=edges["j"], unknown=unknown_flat,
+        w_edge=np.round(np.asarray(w_edge, dtype=np.float64), 12),
+        anchors=anchor_pos, priority=str(priority),
+        anchor_weight=float(anchor_weight),
+        luminance_weight=float(luminance_weight) if priority == "luminance"
+        else -1.0,
+        gauge=bool(singular_flag), excluded=excl)
+
+
+def _solve_wls(target, src_emb, edges, g, w_edge, unknown_flat, local,
+               support, anchors, priority, anchor_weight,
+               luminance_weight, width, *,
+               exclude_edges=None, cache=None, use_cache=True,
+               return_diagnostics=False):
+    """Solve the soft WLS system, reusing a cached factorization when the
+    structural fingerprint is unchanged.
+
+    With ``use_cache=False`` each call assembles and factorizes from scratch.
+    That path exists so callers (and tests/benchmarks) can compare the cached
+    path against a plain full solve.
+    """
+    cache = DEFAULT_CACHE if cache is None else cache
+    t0 = time.perf_counter()
+    A, b, singular, info = assemble_wls(
+        target, src_emb, edges, g, w_edge, unknown_flat, local, support,
+        anchors, priority, anchor_weight, luminance_weight,
+        exclude_edges=exclude_edges)
+    t_assemble = time.perf_counter() - t0
+    n = unknown_flat.size
+
+    fp = _wls_fingerprint(edges, w_edge, unknown_flat, anchors, priority,
+                          anchor_weight, luminance_weight, singular,
+                          exclude_edges)
+    entry = cache.get(fp) if use_cache else None
+    reused = entry is not None
+    t0 = time.perf_counter()
+    if entry is not None and entry.A.shape == A.shape:
+        lu = entry.lu
+        AtA = entry.AtA
+        factor_path = "wls_normal_cg"
+    else:
+        AtA = (A.T @ A).tocsc()
+        try:
+            lu = splu(AtA)
+            factor_path = "wls_normal_cg"
+        except (RuntimeError, ValueError):
+            lu = None
+            factor_path = "wls_lsqr_fallback"
+        if use_cache:
+            cache.put(CachedSystem(fingerprint=fp, A=A, AtA=AtA, lu=lu,
+                                   meta={"rows": int(A.shape[0])}))
+    t_factor = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    x = np.zeros((n, 3))
+    cg_codes = {}
+    if lu is not None:
+        Atb = A.T @ b
+        for c in range(3):
+            x[:, c] = lu.solve(Atb[:, c])
+    else:
+        for c in range(3):
+            sol = lsqr(A, b[:, c], atol=LSQR_ATOL, btol=LSQR_BTOL,
+                       conlim=1e14, iter_lim=LSQR_ITER_LIMIT)
+            x[:, c] = sol[0]
+            cg_codes[c] = int(sol[1])
+    t_solve = time.perf_counter() - t0
+
+    info["path"] = factor_path
+    info["cache_hit"] = bool(reused)
+    info["assemble_ms"] = round(t_assemble * 1e3, 3)
+    info["factor_ms"] = round(t_factor * 1e3, 3)
+    info["solve_ms"] = round(t_solve * 1e3, 3)
+    if cg_codes:
+        for c, v in cg_codes.items():
+            info[f"lsqr_stop_c{c}"] = v
+    if return_diagnostics:
+        info["_A"] = A
+        info["_b"] = b
+    return x, singular, info
+
+
+def solve_wls_reference(target, src_emb, edges, g, w_edge, unknown_flat, local,
+                        support, anchors, priority, anchor_weight,
+                        luminance_weight, width):
+    """Pre-optimization reference: assemble row-by-row, solve normal equations
+    with unpreconditioned CG, never cache.
+
+    This is the exact numerical path the tool used before the sparse-system
+    optimization.  It is kept runnable so benchmarks can compare a direct full
+    solve against the cached/vectorized path and so regression tests have an
+    independent oracle for the same equations.
+    """
+    i, j = edges["i"], edges["j"]
+    li, lj = local[i], local[j]
+    n = unknown_flat.size
+    tgt = target.reshape(-1, 3)
     row_cols: list[np.ndarray] = []
     row_vals: list[np.ndarray] = []
     row_rhs: list[np.ndarray] = []
-    row_sqrt: list[float] = []
-    row_kind: list[str] = []
-
-    # Edge row convention matches the guidance definition:
-    #   (x_j - x_i) = g,  coefficients -1 at i, +1 at j.
-    # g here is already g_solve (= -g_guidance) from the caller; the caller
-    # flips sign because this assembly historically used the reverse row.
     for e in range(i.size):
         sw = np.sqrt(max(w_edge[e], 0.0))
         if sw <= 0.0:
             continue
         if li[e] >= 0 and lj[e] >= 0:
-            # sqrt(w) * (x_j - x_i - g) = 0
             row_cols.append(np.array([li[e], lj[e]], dtype=np.int64))
             row_vals.append(np.array([-sw, sw]))
             row_rhs.append(sw * g[e])
+        elif li[e] >= 0:
+            row_cols.append(np.array([li[e]], dtype=np.int64))
+            row_vals.append(np.array([sw]))
+            row_rhs.append(sw * (tgt[j[e]] - g[e]))
         else:
-            # Perez boundary row with fixed target neighbour:
-            #   unknown i: x_i - t_j = -g  -> x_i = t_j - g
-            #   unknown j: x_j - t_i =  g  -> x_j = t_i + g
-            if li[e] >= 0:
-                row_cols.append(np.array([li[e]], dtype=np.int64))
-                row_vals.append(np.array([sw]))
-                row_rhs.append(sw * (tgt[j[e]] - g[e]))
-            else:
-                row_cols.append(np.array([lj[e]], dtype=np.int64))
-                row_vals.append(np.array([sw]))
-                row_rhs.append(sw * (tgt[i[e]] + g[e]))
-        row_sqrt.append(sw)
-        row_kind.append("gradient")
+            row_cols.append(np.array([lj[e]], dtype=np.int64))
+            row_vals.append(np.array([sw]))
+            row_rhs.append(sw * (tgt[i[e]] + g[e]))
 
-    anchor_flats = []
+    anchor_hit = False
     for a in anchors:
         lf = local[a["flat"]]
         if lf < 0:
@@ -443,72 +694,47 @@ def _solve_wls(target, src_emb, edges, g, w_edge, unknown_flat, local,
         row_cols.append(np.array([lf], dtype=np.int64))
         row_vals.append(np.array([sw]))
         row_rhs.append(sw * a["color"])
-        row_sqrt.append(sw)
-        row_kind.append("anchor")
-        anchor_flats.append((lf, w, a["color"]))
-
+        anchor_hit = True
     if priority == "luminance":
-        # Soft data term pulling toward the source's RGB values (dominated by
-        # luminance in practice); chroma still follows the gradient field.
         src_flat = src_emb.reshape(-1, 3)
         for lf, flat in enumerate(unknown_flat):
             sw = np.sqrt(luminance_weight)
             row_cols.append(np.array([lf], dtype=np.int64))
             row_vals.append(np.array([sw]))
             row_rhs.append(sw * src_flat[flat])
-            row_sqrt.append(sw)
-            row_kind.append("luminance")
 
-    n_rows = len(row_sqrt)
-    if n_rows == 0:
-        raise np.linalg.LinAlgError(
-            "no constraint rows: the selection has neither interior edges "
-            "nor anchors (system is empty and underdetermined)")
+    n_rows = len(row_cols)
     row_idx = np.concatenate([np.full(c.size, r, dtype=np.int64)
                               for r, c in enumerate(row_cols)])
-    cols = np.concatenate(row_cols)
-    vals = np.concatenate(row_vals)
-    A = sparse.coo_matrix((vals, (row_idx, cols)),
+    A = sparse.coo_matrix((np.concatenate(row_vals), (row_idx,
+                                                      np.concatenate(row_cols))),
                           shape=(n_rows, n)).tocsr()
     b = np.asarray(row_rhs, dtype=np.float64)
-    kind = np.asarray(row_kind, dtype=object)
-    sw_arr = np.asarray(row_sqrt, dtype=np.float64)
-
-    # Singular iff no row reaches a known target value (support covers the
-    # whole canvas) and no anchor pins a level.
     reaches_known = np.any((li < 0) | (lj < 0))
-    singular = not reaches_known and not anchor_flats
+    singular = not reaches_known and not anchor_hit
     if singular:
         grow = sparse.coo_matrix(
             (np.full(n, np.sqrt(GAUGE_WEIGHT)),
-             (np.zeros(n, dtype=np.int64), np.arange(n))),
-            shape=(1, n))
+             (np.zeros(n, dtype=np.int64), np.arange(n))), shape=(1, n))
         A = sparse.vstack([A, grow], format="csr")
         b = np.vstack([b, np.zeros((1, 3))])
-        kind = np.concatenate([kind, np.array(["gauge"], dtype=object)])
-        sw_arr = np.concatenate([sw_arr, np.full(1, np.sqrt(GAUGE_WEIGHT))])
-
-    info = {"path": "wls_normal_cg", "rows": int(A.shape[0]),
-            "unknowns": int(n), "gauge": bool(singular)}
-    # Normal equations A^T A x = A^T b are SPD whenever the system has a
-    # unique solution. The weighted graph Laplacian stays well conditioned
-    # here (boundary rows pin every component), so plain CG converges tightly
-    # where LSQR stops early on condition-number estimates.
     AtA = (A.T @ A).tocsr()
     Atb = A.T @ b
     x = np.zeros((n, 3))
+    info = {"path": "wls_normal_cg", "rows": int(A.shape[0]),
+            "unknowns": int(n), "gauge": bool(singular)}
+    total_iters = 0
     for c in range(3):
-        sol_x, code = cg(AtA, Atb[:, c], rtol=1e-12,
-                         maxiter=LSQR_ITER_LIMIT)
+        iters = [0]
+        def _cb(*_args):
+            iters[0] += 1
+        sol_x, code = cg(AtA, Atb[:, c], rtol=1e-12, maxiter=LSQR_ITER_LIMIT,
+                         callback=_cb)
         x[:, c] = sol_x
         info[f"cg_code_c{c}"] = int(code)
-        if code != 0:
-            # Fallback: high condition-limit LSQR.
-            sol = lsqr(A, b[:, c], atol=LSQR_ATOL, btol=LSQR_BTOL,
-                       conlim=1e14, iter_lim=LSQR_ITER_LIMIT)
-            x[:, c] = sol[0]
-            info[f"lsqr_stop_c{c}"] = int(sol[1])
-            info["path"] = "wls_lsqr_fallback"
+        info[f"cg_iter_c{c}"] = iters[0]
+        total_iters += iters[0]
+    info["cg_iterations"] = total_iters
     return x, singular, info
 
 

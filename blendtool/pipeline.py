@@ -50,6 +50,7 @@ def add_blend_step(project: dict, *, name: str = "blend") -> dict:
             "anchor_weight": 50.0,
             "luminance_weight": 0.25,
             "gradient_weight_scale": 1.0,
+            "seam_column": None,       # optional x split for seam partition
         },
     }
     project["steps"].append(step)
@@ -136,7 +137,9 @@ class Pipeline:
             anchors=p.get("anchors", []),
             anchor_weight=float(p.get("anchor_weight", 50.0)),
             luminance_weight=float(p.get("luminance_weight", 0.25)),
-            gradient_weight_scale=float(p.get("gradient_weight_scale", 1.0)))
+            gradient_weight_scale=float(p.get("gradient_weight_scale", 1.0)),
+            seam_column=(int(p["seam_column"])
+                         if p.get("seam_column") is not None else None))
 
 
 def export_result(image: np.ndarray, path: str) -> None:

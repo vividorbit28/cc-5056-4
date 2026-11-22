@@ -142,6 +142,14 @@
         <div><label>放置 X</label><input type="number" id="place-x" value="48"></div>
         <div><label>放置 Y</label><input type="number" id="place-y" value="48"></div>
       </div>
+      <label style="margin-top:8px">拼缝分区（可选，目标图 x 坐标）</label>
+      <div class="row2">
+        <div><input type="checkbox" id="seam-enable" style="width:auto">
+          <label style="display:inline;margin-left:4px">启用细缝分区</label></div>
+        <div><input type="number" id="seam-column" value="0" min="0" step="1"></div>
+      </div>
+      <p class="hint">右侧分区只受梯度与拼缝相对差约束；两侧各留亮度锚时可各自更新。
+        去掉右侧最后一个锚后右侧保持待定，不发布绝对色值。</p>
       <button class="primary" id="btn-run">建立并求解离散系统</button>
     </div>
 
@@ -358,9 +366,15 @@ function renderAnchors() {
   const el = $("#anchor-list");
   el.innerHTML = state.anchors.length
     ? state.anchors.map((a, k) => `<span class="pill">#${k+1} (${a.x},${a.y})
-        ${a.source ? "取源色" : "RGB " + a.color.join(",")} w=${a.weight}</span>`)
+        ${a.source ? "取源色" : "RGB " + a.color.join(",")} w=${a.weight}
+        <b class="rm" data-idx="${k}" title="移除该锚点"
+           style="cursor:pointer;color:#ff7a7a">✕</b></span>`)
         .join("")
     : '<span class="hint">无锚点</span>';
+  el.querySelectorAll(".rm").forEach(b => b.onclick = () => {
+    state.anchors.splice(+b.dataset.idx, 1);
+    renderAnchors(); redrawTarget();
+  });
 }
 
 $("#btn-run").onclick = async () => {
@@ -373,13 +387,15 @@ $("#btn-run").onclick = async () => {
     anchor_weight: +$("#anchor-weight").value,
     luminance_weight: +$("#luminance-weight").value,
     target_xy: [+$("#place-x").value, +$("#place-y").value],
+    seam_column: $("#seam-enable").checked
+      ? +$("#seam-column").value : null,
     anchors: state.anchors.map(a => a.source
       ? {x: a.x, y: a.y, source: true, weight: a.weight}
       : {x: a.x, y: a.y, color: a.color, weight: a.weight}),
   };
   const d = await fetchJSON("/api/blend", body);
   if (d.error) { $("#warnings").innerHTML =
-      `<p class="err">${d.error}</p>`; return; }
+      `<p class="err">求解失败：${d.error}</p>`; return; }
   state.lastImages = {
     result: d.result, residual: d.residual, boundary: d.boundary,
     drift: d.drift, source_delta: d.source_delta,
@@ -441,6 +457,20 @@ function renderMetrics(d) {
   if ("weighted_residual_rms" in m)
     rows.push(["加权残差 RMS", m.weighted_residual_rms],
               ["锚点残差 RMS", m.anchor_residual_rms]);
+  if (m.seam) {
+    const s = m.seam;
+    rows.push(
+      ["拼缝分区状态", s.status],
+      ["拼缝列 x", s.column],
+      ["左侧锚点 / 右侧锚点", `${s.left_anchors} / ${s.right_anchors}`],
+      ["左侧亮度均值", s.left_mean_lum],
+      ["右侧亮度均值", s.right_mean_lum],
+      ["拼缝梯度 RMS", s.seam_gradient_rms],
+      ["拼缝梯度误差 RMS", s.seam_gradient_error_rms],
+      ["拼缝可见跳变（亮度）", s.seam_visible_jump_rms_lum],
+      ["右侧绝对亮度已确定", s.right_absolute ? "是" : "否（待定）"],
+    );
+  }
   let html = "<table><tr><th>指标</th><th>数值</th></tr>";
   for (const [k, v] of rows)
     html += `<tr><td>${k}</td><td>${fmt(v)}</td></tr>`;

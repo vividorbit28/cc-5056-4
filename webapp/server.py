@@ -15,8 +15,19 @@ from blendtool import io_utils
 from blendtool.masks import rasterize_selection, soft_mask_from_hard, Placement
 from blendtool.solver import blend
 from blendtool.pipeline import default_project, add_blend_step, save_project
+from blendtool.system_cache import DEFAULT_CACHE
 
 app = Flask(__name__)
+
+
+@app.after_request
+def _allow_same_origin_tools(resp):
+    # Lets a locally opened page or a same-machine tool call the API; the app
+    # is a local workbench, not a public service.
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return resp
 WORK = Path(__file__).resolve().parent.parent / "webwork"
 WORK.mkdir(exist_ok=True)
 
@@ -134,6 +145,9 @@ def run_blend():
         if hard.sum() == 0:
             return jsonify({"error": "empty selection"}), 400
         placement = _placement(params, hard)
+        seam_column = params.get("seam_column")
+        if seam_column is not None:
+            seam_column = int(round(float(seam_column)))
         br = blend(
             STATE["source"], STATE["target"], hard,
             placement.offset_y, placement.offset_x,
@@ -144,7 +158,8 @@ def run_blend():
             anchor_weight=float(params.get("anchor_weight", 50.0)),
             luminance_weight=float(params.get("luminance_weight", 0.25)),
             gradient_weight_scale=float(
-                params.get("gradient_weight_scale", 1.0)))
+                params.get("gradient_weight_scale", 1.0)),
+            seam_column=seam_column)
     except Exception as exc:  # numerical failures reported, never hidden
         return jsonify({"error": repr(exc)}), 500
 
@@ -174,7 +189,21 @@ def run_blend():
         "components": br.components,
         "hole_pixels": br.hole_pixels,
         "anchors_used": br.anchors_used,
+        "seam": br.metrics.get("seam"),
+        "solver": br.metrics.get("solver"),
+        "cache_stats": DEFAULT_CACHE.stats(),
     })
+
+
+@app.get("/api/cache")
+def cache_stats():
+    return jsonify(DEFAULT_CACHE.stats())
+
+
+@app.post("/api/cache/clear")
+def cache_clear():
+    DEFAULT_CACHE.clear()
+    return jsonify({"ok": True, "stats": DEFAULT_CACHE.stats()})
 
 
 @app.get("/api/project")
