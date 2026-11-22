@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>梯度域局部融接工作台</title>
+<style>
+  :root {
+    --bg: #14171c; --panel: #1d222a; --line: #2c333d; --text: #d7dde6;
+    --muted: #8a94a3; --accent: #5aa7ff; --warn: #f0b45a; --err: #ff7a7a;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 13px/1.5 -apple-system, "Segoe UI", "PingFang SC", sans-serif; }
+  header { padding: 10px 16px; border-bottom: 1px solid var(--line);
+           display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  .layout { display: grid; grid-template-columns: 1fr 340px; gap: 12px;
+            padding: 12px; }
+  .canvas-wrap { background: var(--panel); border: 1px solid var(--line);
+                 border-radius: 8px; padding: 10px; }
+  .canvas-row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .canvas-box { position: relative; }
+  .canvas-box h3 { margin: 0 0 6px; font-size: 12px; color: var(--muted);
+                   font-weight: 600; }
+  canvas { background: #0b0d10; border-radius: 4px; cursor: crosshair;
+           max-width: 100%; }
+  .side { display: flex; flex-direction: column; gap: 10px; }
+  .card { background: var(--panel); border: 1px solid var(--line);
+          border-radius: 8px; padding: 12px; }
+  .card h2 { font-size: 12px; margin: 0 0 8px; color: var(--accent);
+             text-transform: uppercase; letter-spacing: .05em; }
+  label { display: block; margin: 6px 0 2px; color: var(--muted); }
+  select, input[type=number], button {
+    background: #11151a; color: var(--text); border: 1px solid var(--line);
+    border-radius: 5px; padding: 5px 8px; font-size: 12px; width: 100%; }
+  button { cursor: pointer; margin-top: 6px; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: #1f3a5c; border-color: #2f5a8c; }
+  .tools { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .tools button { margin: 0; }
+  .tools button.active { background: #244a76; border-color: var(--accent); }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  td, th { padding: 3px 4px; border-bottom: 1px solid var(--line);
+           text-align: right; }
+  td:first-child, th:first-child { text-align: left; color: var(--muted); }
+  .warn { color: var(--warn); font-size: 11.5px; margin: 4px 0;
+          padding-left: 14px; text-indent: -14px; }
+  .err { color: var(--err); }
+  .layers { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+  .layers button { margin: 0; font-size: 11px; padding: 6px 2px; }
+  .layers button.active { background: #244a76; border-color: var(--accent); }
+  .view-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
+               margin-top: 10px; }
+  .view-grid figure { margin: 0; background: #11151a; border-radius: 6px;
+                      padding: 6px; }
+  .view-grid figcaption { font-size: 10.5px; color: var(--muted);
+                          margin-bottom: 4px; }
+  .view-grid img { width: 100%; border-radius: 3px; display: block; }
+  .hint { color: var(--muted); font-size: 11px; }
+  .anchor-list { max-height: 90px; overflow: auto; font-size: 11px; }
+  .pill { display: inline-block; background: #243044; border-radius: 10px;
+          padding: 1px 8px; margin: 2px; font-size: 10.5px; }
+  input[type=range] { width: 100%; }
+  .val { float: right; color: var(--text); }
+</style>
+</head>
+<body>
+<header>
+  <h1>梯度域局部融接工作台</h1>
+  <button id="btn-demo" style="width:auto">载入合成示例（已知梯度）</button>
+  <label class="hint" style="margin:0">来源：</label>
+  <input type="file" id="file-source" accept="image/*" style="width:auto">
+  <label class="hint" style="margin:0">目标：</label>
+  <input type="file" id="file-target" accept="image/*" style="width:auto">
+  <span style="flex:1"></span>
+  <button id="btn-save-project" style="width:auto">保存参数链</button>
+  <label class="hint" style="margin:0">载入：</label>
+  <input type="file" id="file-project" accept=".json" style="width:auto">
+</header>
+
+<div class="layout">
+  <div>
+    <div class="canvas-wrap">
+      <div class="canvas-row">
+        <div class="canvas-box">
+          <h3>来源图 — 绘制选区（多边形/矩形/椭圆，可挖洞）</h3>
+          <canvas id="src-canvas"></canvas>
+        </div>
+        <div class="canvas-box">
+          <h3>目标图 — 放置位置与颜色锚点</h3>
+          <canvas id="tgt-canvas"></canvas>
+        </div>
+      </div>
+      <div class="view-grid" id="view-grid"></div>
+    </div>
+  </div>
+
+  <div class="side">
+    <div class="card">
+      <h2>选区工具</h2>
+      <div class="tools">
+        <button data-tool="polygon" class="active">多边形</button>
+        <button data-tool="rectangle">矩形</button>
+        <button data-tool="ellipse">椭圆</button>
+        <button data-tool="anchor">颜色锚点</button>
+      </div>
+      <div class="row2" style="margin-top:6px">
+        <button id="btn-finish-poly">闭合多边形</button>
+        <button id="btn-subtract">挖洞模式</button>
+      </div>
+      <button id="btn-clear-shapes">清除选区</button>
+      <button id="btn-clear-anchors">清除锚点</button>
+      <p class="hint">锚点：先在目标图点击，再选颜色。冲突锚点（同一像素多个值）会被显式报告并按优先级加权求解。</p>
+      <div class="anchor-list" id="anchor-list"></div>
+    </div>
+
+    <div class="card">
+      <h2>梯度域模型参数</h2>
+      <label>引导梯度策略</label>
+      <select id="strategy">
+        <option value="source">来源梯度（经典泊松）</option>
+        <option value="mixed">混合梯度（保留强边缘）</option>
+        <option value="direct">直接颜色复制（不求解，对照）</option>
+      </select>
+      <label>系统类型 / 软选区羽化 <span class="val" id="feather-val">0 px</span></label>
+      <input type="range" id="feather" min="0" max="30" step="0.5" value="0">
+      <label>冲突优先级</label>
+      <select id="priority">
+        <option value="edge">优先守边缘（梯度权重大）</option>
+        <option value="luminance">优先守亮度（锚点/亮度数据项）</option>
+      </select>
+      <div class="row2">
+        <div><label>锚点权重</label>
+          <input type="number" id="anchor-weight" value="50" min="0" step="1"></div>
+        <div><label>亮度项权重</label>
+          <input type="number" id="luminance-weight" value="0.25"
+                 min="0" step="0.05"></div>
+      </div>
+      <div class="row2">
+        <div><label>放置 X</label><input type="number" id="place-x" value="48"></div>
+        <div><label>放置 Y</label><input type="number" id="place-y" value="48"></div>
+      </div>
+      <button class="primary" id="btn-run">建立并求解离散系统</button>
+    </div>
+
+    <div class="card">
+      <h2>结果图层</h2>
+      <div class="layers">
+        <button data-layer="result" class="active">融接结果</button>
+        <button data-layer="residual">梯度残差</button>
+        <button data-layer="boundary">边界跳变</button>
+        <button data-layer="drift">颜色漂移</button>
+        <button data-layer="source_delta">对源改动</button>
+        <button data-layer="anchor_residual">锚点残差</button>
+      </div>
+      <button id="btn-export">导出当前图层 PNG</button>
+    </div>
+
+    <div class="card">
+      <h2>数值诊断（非主观判断）</h2>
+      <div id="metrics"><p class="hint">尚未求解。</p></div>
+    </div>
+
+    <div class="card">
+      <h2>求解器与拓扑警告</h2>
+      <div id="warnings"><p class="hint">无。</p></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const state = {
+  source: null, target: null, sourceShape: null, targetShape: null,
+  tool: "polygon", subtract: false,
+  shapes: [], currentPoly: [], anchors: [],
+  lastImages: {}, currentLayer: "result",
+  anchorColor: [0.95, 0.2, 0.2], useSourceColor: true,
+};
+const srcCanvas = $("#src-canvas"), tgtCanvas = $("#tgt-canvas");
+const sctx = srcCanvas.getContext("2d"), tctx = tgtCanvas.getContext("2d");
+
+function fetchJSON(url, body) {
+  return fetch(url, {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body || {}),
+  }).then(r => r.json());
+}
+
+function fileToDataURL(file) {
+  return new Promise((res, rej) => {
+    const fr = new FileReader();
+    fr.onload = () => res(fr.result);
+    fr.onerror = rej;
+    fr.readAsDataURL(file);
+  });
+}
+
+function drawImageTo(canvas, ctx, dataUrl, callback) {
+  const img = new Image();
+  img.onload = () => {
+    canvas.width = img.width; canvas.height = img.height;
+    ctx.drawImage(img, 0, 0);
+    callback && callback(img.width, img.height);
+  };
+  img.src = dataUrl;
+}
+
+$("#file-source").addEventListener("change", async (e) => {
+  const url = await fileToDataURL(e.target.files[0]);
+  state.source = url;
+  await fetchJSON("/api/upload", {kind: "source", data_url: url,
+                                  name: e.target.files[0].name});
+  drawImageTo(srcCanvas, sctx, url, (w, h) => { state.sourceShape = [h, w]; });
+  redrawSource();
+});
+$("#file-target").addEventListener("change", async (e) => {
+  const url = await fileToDataURL(e.target.files[0]);
+  state.target = url;
+  await fetchJSON("/api/upload", {kind: "target", data_url: url,
+                                  name: e.target.files[0].name});
+  drawImageTo(tgtCanvas, tctx, url, (w, h) => {
+    state.targetShape = [h, w];
+    $("#place-x").value = Math.round(w / 2);
+    $("#place-y").value = Math.round(h / 2);
+  });
+  redrawTarget();
+});
+$("#btn-demo").onclick = async () => {
+  const d = await fetchJSON("/api/demo", {size: 96});
+  state.source = d.source; state.target = d.target;
+  drawImageTo(srcCanvas, sctx, d.source, (w, h) => state.sourceShape = [h, w]);
+  drawImageTo(tgtCanvas, tctx, d.target, (w, h) => {
+    state.targetShape = [h, w];
+    $("#place-x").value = Math.round(w / 2);
+    $("#place-y").value = Math.round(h / 2);
+  });
+  state.shapes = [{type: "rectangle", op: "add",
+                   points: [[18, 18], [78, 78]]}];
+  redrawSource(); redrawTarget();
+};
+
+document.querySelectorAll(".tools button").forEach(b => b.onclick = () => {
+  state.tool = b.dataset.tool;
+  document.querySelectorAll(".tools button").forEach(x =>
+    x.classList.toggle("active", x === b));
+});
+$("#btn-subtract").onclick = (e) => {
+  state.subtract = !state.subtract;
+  e.target.classList.toggle("active", state.subtract);
+};
+$("#btn-clear-shapes").onclick = () => {
+  state.shapes = []; state.currentPoly = []; redrawSource();
+};
+$("#btn-clear-anchors").onclick = () => {
+  state.anchors = []; renderAnchors(); redrawTarget();
+};
+$("#btn-finish-poly").onclick = () => {
+  if (state.currentPoly.length >= 3) {
+    state.shapes.push({type: "polygon",
+      op: state.subtract ? "subtract" : "add",
+      points: state.currentPoly.slice()});
+    state.currentPoly = []; redrawSource();
+  }
+};
+$("#feather").oninput = (e) =>
+  $("#feather-val").textContent = e.target.value + " px";
+
+function eventPos(canvas, ev) {
+  const r = canvas.getBoundingClientRect();
+  return [Math.round((ev.clientX - r.left) * canvas.width / r.width),
+          Math.round((ev.clientY - r.top) * canvas.height / r.height)];
+}
+
+srcCanvas.addEventListener("click", (ev) => {
+  if (!state.source) return;
+  const [x, y] = eventPos(srcCanvas, ev);
+  if (state.tool === "polygon") {
+    state.currentPoly.push([x, y]); redrawSource();
+  } else if (state.tool === "rectangle" || state.tool === "ellipse") {
+    const size = 28;
+    state.shapes.push({type: state.tool,
+      op: state.subtract ? "subtract" : "add",
+      points: [[x - size, y - size], [x + size, y + size]]});
+    redrawSource();
+  }
+});
+srcCanvas.addEventListener("dblclick", () => $("#btn-finish-poly").click());
+
+tgtCanvas.addEventListener("click", (ev) => {
+  if (!state.target || state.tool !== "anchor") return;
+  const [x, y] = eventPos(tgtCanvas, ev);
+  const color = state.useSourceColor
+    ? null : state.anchorColor.map(v => +(v / 255).toFixed(3));
+  state.anchors.push({x, y, color, source: state.useSourceColor,
+                      weight: +$("#anchor-weight").value});
+  renderAnchors(); redrawTarget();
+});
+
+function drawShapes(ctx, shapes, poly) {
+  ctx.save();
+  for (const s of shapes) {
+    ctx.beginPath();
+    const p = s.points;
+    if (s.type === "ellipse") {
+      const [x0, y0] = p[0], [x1, y1] = p[1];
+      ctx.ellipse((x0+x1)/2, (y0+y1)/2, Math.abs(x1-x0)/2,
+                  Math.abs(y1-y0)/2, 0, 0, Math.PI*2);
+    } else {
+      ctx.moveTo(p[0][0], p[0][1]);
+      p.slice(1).forEach(q => ctx.lineTo(q[0], q[1]));
+      if (s.type === "rectangle") ctx.closePath();
+    }
+    ctx.strokeStyle = s.op === "subtract" ? "#ff7a7a" : "#5aa7ff";
+    ctx.fillStyle = s.op === "subtract" ? "rgba(255,122,122,.18)"
+                                        : "rgba(90,167,255,.18)";
+    ctx.lineWidth = 1.5; ctx.fill(); ctx.stroke();
+  }
+  if (poly && poly.length) {
+    ctx.beginPath(); ctx.moveTo(poly[0][0], poly[0][1]);
+    poly.slice(1).forEach(q => ctx.lineTo(q[0], q[1]));
+    ctx.strokeStyle = "#9fd0ff"; ctx.setLineDash([4, 3]); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  ctx.restore();
+}
+
+function redrawSource() {
+  if (!state.source) return;
+  const img = new Image();
+  img.onload = () => {
+    sctx.clearRect(0, 0, srcCanvas.width, srcCanvas.height);
+    sctx.drawImage(img, 0, 0);
+    drawShapes(sctx, state.shapes, state.currentPoly);
+  };
+  img.src = state.source;
+}
+function redrawTarget() {
+  if (!state.target) return;
+  const img = new Image();
+  img.onload = () => {
+    tctx.clearRect(0, 0, tgtCanvas.width, tgtCanvas.height);
+    tctx.drawImage(img, 0, 0);
+    state.anchors.forEach((a, k) => {
+      tctx.beginPath(); tctx.arc(a.x, a.y, 5, 0, Math.PI*2);
+      tctx.fillStyle = a.source ? "#7dffa0" :
+        `rgb(${a.color.map(v=>Math.round(v*255)).join(",")})`;
+      tctx.fill(); tctx.strokeStyle = "#fff"; tctx.stroke();
+      tctx.fillStyle = "#fff"; tctx.font = "10px sans-serif";
+      tctx.fillText(String(k+1), a.x+7, a.y-6);
+    });
+  };
+  img.src = state.target;
+}
+function renderAnchors() {
+  const el = $("#anchor-list");
+  el.innerHTML = state.anchors.length
+    ? state.anchors.map((a, k) => `<span class="pill">#${k+1} (${a.x},${a.y})
+        ${a.source ? "取源色" : "RGB " + a.color.join(",")} w=${a.weight}</span>`)
+        .join("")
+    : '<span class="hint">无锚点</span>';
+}
+
+$("#btn-run").onclick = async () => {
+  if (!state.source || !state.target) { alert("请先载入两张图"); return; }
+  const body = {
+    shapes: state.shapes,
+    feather_px: +$("#feather").value,
+    strategy: $("#strategy").value,
+    priority: $("#priority").value,
+    anchor_weight: +$("#anchor-weight").value,
+    luminance_weight: +$("#luminance-weight").value,
+    target_xy: [+$("#place-x").value, +$("#place-y").value],
+    anchors: state.anchors.map(a => a.source
+      ? {x: a.x, y: a.y, source: true, weight: a.weight}
+      : {x: a.x, y: a.y, color: a.color, weight: a.weight}),
+  };
+  const d = await fetchJSON("/api/blend", body);
+  if (d.error) { $("#warnings").innerHTML =
+      `<p class="err">${d.error}</p>`; return; }
+  state.lastImages = {
+    result: d.result, residual: d.residual, boundary: d.boundary,
+    drift: d.drift, source_delta: d.source_delta,
+    anchor_residual: d.anchor_residual,
+  };
+  renderViews(); renderMetrics(d); renderWarnings(d);
+};
+
+function renderViews() {
+  const names = {result: "融接结果（裁剪后显示）", residual: "梯度方程残差 RMS",
+    boundary: "边界跳变幅度", drift: "亮度漂移（蓝负红正）",
+    source_delta: "相对直接复制源的改动", anchor_residual: "锚点残差"};
+  $("#view-grid").innerHTML = Object.entries(state.lastImages).map(
+    ([k, url]) => `<figure><figcaption>${names[k]}</figcaption>
+      <img src="${url}" data-layer="${k}" style="cursor:pointer"></figure>`
+  ).join("");
+  document.querySelectorAll("#view-grid img").forEach(img =>
+    img.onclick = () => {
+      state.currentLayer = img.dataset.layer;
+      document.querySelectorAll(".layers button").forEach(b =>
+        b.classList.toggle("active", b.dataset.layer === state.currentLayer));
+    });
+}
+document.querySelectorAll(".layers button").forEach(b => b.onclick = () => {
+  state.currentLayer = b.dataset.layer;
+  document.querySelectorAll(".layers button").forEach(x =>
+    x.classList.toggle("active", x === b));
+});
+
+function fmt(v) {
+  if (typeof v === "number") return Math.abs(v) < 1e-4 ? v.toExponential(2)
+    : v.toFixed(5);
+  if (Array.isArray(v)) return "[" + v.map(fmt).join(", ") + "]";
+  return String(v);
+}
+function renderMetrics(d) {
+  const m = d.metrics;
+  const rows = [
+    ["系统类型", m.mode], ["引导策略", m.strategy], ["优先级", m.priority],
+    ["未知像素数", m.n_unknown], ["边方程数", m.n_edges],
+    ["连通分量", m.n_components], ["孔洞像素", m.n_hole_pixels],
+    ["梯度残差 RMS", m.gradient_residual_rms],
+    ["梯度残差最大", m.gradient_residual_max],
+    ["亮度通道残差 RMS", m.gradient_residual_rms_lum],
+    ["边界引导失配 RMS", m.boundary_guidance_mismatch_rms],
+    ["边界跳变 RMS", m.boundary_jump_rms],
+    ["引入边界跳变 RMS", m.boundary_introduced_rms],
+    ["区内亮度漂移均值", m.drift_mean_lum_inside],
+    ["区内亮度漂移标准差", m.drift_std_lum_inside],
+    ["最大绝对漂移", m.drift_abs_max_lum],
+    ["每通道漂移均值", m.drift_mean_per_channel],
+    ["每通道最大漂移", m.drift_per_channel_max_abs],
+    ["超色域像素比例", m.out_of_gamut_fraction_inside],
+    ["被裁剪像素数", m.clipped_pixels_inside],
+    ["源梯度能量", m.source_gradient_energy_inside],
+    ["结果梯度能量", m.result_gradient_energy_inside],
+    ["细节能量保留比", m.detail_energy_ratio],
+  ];
+  if ("weighted_residual_rms" in m)
+    rows.push(["加权残差 RMS", m.weighted_residual_rms],
+              ["锚点残差 RMS", m.anchor_residual_rms]);
+  let html = "<table><tr><th>指标</th><th>数值</th></tr>";
+  for (const [k, v] of rows)
+    html += `<tr><td>${k}</td><td>${fmt(v)}</td></tr>`;
+  html += "</table>";
+  $("#metrics").innerHTML = html;
+}
+function renderWarnings(d) {
+  const items = [];
+  d.warnings.forEach(w => items.push(`<p class="warn">• ${w}</p>`));
+  d.components.forEach(c => items.push(
+    `<p class="hint">分量 ${c.label}: ${c.pixels} 像素, 边界框 ${c.bbox.join(",")}
+     ${c.touches_border ? "（接触画幅边界）" : ""}</p>`));
+  if (d.anchors_used.length)
+    items.push(`<p class="hint">生效锚点 ${d.anchors_used.length} 个，孔洞像素 ${d.hole_pixels}</p>`);
+  $("#warnings").innerHTML = items.length ? items.join("") : "<p class='hint'>无。</p>";
+}
+
+$("#btn-export").onclick = async () => {
+  const resp = await fetch("/api/export", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({kind: state.currentLayer}),
+  });
+  if (!resp.ok) {
+    const d = await resp.json().catch(() => ({}));
+    return alert(d.error || "导出失败");
+  }
+  const blob = await resp.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = state.currentLayer + ".png";
+  a.click();
+};
+$("#btn-save-project").onclick = async () => {
+  const resp = await fetch("/api/project/save", {method: "POST"});
+  if (!resp.ok) return alert("暂无可保存项目");
+  const blob = await resp.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "blend_project.json"; a.click();
+};
+$("#file-project").addEventListener("change", async (e) => {
+  const fd = new FormData(); fd.append("project", e.target.files[0]);
+  const r = await fetch("/api/project/load", {method: "POST", body: fd});
+  const d = await r.json();
+  if (d.error) return alert(d.error);
+  const step = d.project.steps.at(-1);
+  if (step) {
+    state.shapes = step.params.shapes || [];
+    state.anchors = step.params.anchors || [];
+    $("#feather").value = step.params.feather_px || 0;
+    $("#feather-val").textContent = ($("#feather").value) + " px";
+    $("#strategy").value = step.params.strategy;
+    $("#priority").value = step.params.priority;
+    if (step.params.target_xy) {
+      $("#place-x").value = step.params.target_xy[0];
+      $("#place-y").value = step.params.target_xy[1];
+    }
+    redrawSource(); redrawTarget(); renderAnchors();
+  }
+});
+renderAnchors();
+</script>
+</body>
+</html>
